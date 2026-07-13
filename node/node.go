@@ -120,6 +120,14 @@ type Node struct {
 	// that ApplyOperation is idempotent (plan test 4 in Phase 6).
 	executedSeqs map[int]bool
 	mu           sync.RWMutex
+
+	// ── Reputation-Weighted Voting (RWV extension) ───────────────────────────
+	// Reputation is this node's own trust score (set via InitReputation).
+	Reputation int
+
+	// KnownReputations maps peer node IDs to their reputation scores.
+	// Populated by InitReputation after NewNode; used by GetPrepareWeight / GetCommitWeight.
+	KnownReputations map[string]int
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -383,4 +391,74 @@ func (n *Node) SetLocation(loc cluster.Point) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.Location = loc
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reputation-Weighted Voting (RWV) — additive extension
+// ─────────────────────────────────────────────────────────────────────────────
+
+// InitReputation sets this node's own reputation and its knowledge of peer reputations.
+// Must be called after NewNode, before RunPBFT.
+// Thread-safe: holds mu.Lock during write.
+func (n *Node) InitReputation(rep int, clusterReps map[string]int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.Reputation = rep
+	n.KnownReputations = make(map[string]int, len(clusterReps))
+	for k, v := range clusterReps {
+		n.KnownReputations[k] = v
+	}
+}
+
+// reputationOf returns the reputation score for a given node ID.
+// Returns 1 (not 0) for unknown nodes to avoid accidental exclusion.
+// Caller must NOT hold mu (calls mu.RLock internally via KnownReputations).
+// NOTE: this is called only from GetPrepareWeight/GetCommitWeight which
+// already hold mu.RLock, so we access KnownReputations directly (no re-lock).
+func (n *Node) reputationOf(id string) int {
+	if r, ok := n.KnownReputations[id]; ok {
+		return r
+	}
+	return 1
+}
+
+// GetPrepareWeight returns the total reputation weight of all senders
+// that have submitted a Prepare for the given sequence ID.
+// Thread-safe: holds mu.RLock during read.
+func (n *Node) GetPrepareWeight(seqID int) int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	senders, ok := n.Prepares[seqID]
+	if !ok {
+		return 0
+	}
+	total := 0
+	for id := range senders {
+		total += n.reputationOf(id)
+	}
+	return total
+}
+
+// GetCommitWeight returns the total reputation weight of all senders
+// that have submitted a Commit for the given sequence ID.
+// Thread-safe: holds mu.RLock during read.
+func (n *Node) GetCommitWeight(seqID int) int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	senders, ok := n.Commits[seqID]
+	if !ok {
+		return 0
+	}
+	total := 0
+	for id := range senders {
+		total += n.reputationOf(id)
+	}
+	return total
+}
+
+// HasReputationQuorum reports whether accumulatedWeight meets the
+// reputation-weighted quorum threshold for a given totalClusterWeight.
+// The threshold mirrors the classical 2f+1 rule: >= floor(2/3 * total) + 1.
+func HasReputationQuorum(accumulatedWeight, totalClusterWeight int) bool {
+	return accumulatedWeight >= (2*totalClusterWeight/3)+1
 }

@@ -74,6 +74,15 @@ type PBFTInstance struct {
 	// opLog maps sequence ID → operation string, used by the step-by-step API.
 	opLog map[int]string
 	mu    sync.Mutex
+
+	// ── Reputation-Weighted Voting (RWV) extension ───────────────────────────
+	// UseReputation activates reputation-weighted quorum when true.
+	// When false the exact legacy path is used (zero-breakage guarantee).
+	UseReputation bool
+
+	// TotalClusterReputation is the sum of all node reputation scores in this cluster.
+	// Required for HasReputationQuorum threshold computation.
+	TotalClusterReputation int
 }
 
 // NewPBFTInstance creates a PBFTInstance.
@@ -188,25 +197,75 @@ func (p *PBFTInstance) RunPBFT(ctx context.Context, operation, clientID string) 
 	commitEnvs := make([]messages.Envelope, 0, len(all))
 	commitProduced := make(map[string]bool)
 
-	for _, nd := range all {
-		for _, pEnv := range prepareEnvs {
-			if pEnv.SenderID == nd.ID {
-				continue // skip own — already self-counted in Phase 2
+	if p.UseReputation {
+		// Reputation path — accumulate weight; produce commit once weighted quorum met.
+		for _, nd := range all {
+			for _, pEnv := range prepareEnvs {
+				if pEnv.SenderID == nd.ID {
+					continue // skip own — already self-counted in Phase 2
+				}
+				var prepare messages.Prepare
+				messages.DecodeBody(pEnv, &prepare)
+				nd.AddPrepare(prepare.SequenceID, pEnv.SenderID)
+				if commitProduced[nd.ID] {
+					continue
+				}
+				w := nd.GetPrepareWeight(prepare.SequenceID)
+				if !node.HasReputationQuorum(w, p.TotalClusterReputation) {
+					continue
+				}
+				// Weighted quorum met — try the standard HandlePrepare path first.
+				cPtr, cerr := nd.HandlePrepare(pEnv, p.FLocal)
+				if cerr != nil || cPtr == nil {
+					// HandlePrepare returns nil when raw count < 2f+1; build commit directly.
+					seqID := prepare.SequenceID
+					commit := messages.Commit{
+						SequenceID: seqID,
+						ViewNumber: nd.GetViewNumber(),
+						Digest:     prepare.Digest,
+						NodeID:     nd.ID,
+					}
+					env, err := messages.NewEnvelope(messages.MsgCommit, nd.ID, commit, nd.PrivKey)
+					if err != nil {
+						continue
+					}
+					// Self-count own commit.
+					nd.AddCommit(seqID, nd.ID)
+					commitEnvs = append(commitEnvs, env)
+					commitProduced[nd.ID] = true
+					continue
+				}
+				// HandlePrepare produced a commit via count path — self-count it.
+				var selfC messages.Commit
+				if err := messages.DecodeBody(*cPtr, &selfC); err == nil {
+					nd.AddCommit(selfC.SequenceID, nd.ID)
+				}
+				commitEnvs = append(commitEnvs, *cPtr)
+				commitProduced[nd.ID] = true
 			}
-			cPtr, err := nd.HandlePrepare(pEnv, p.FLocal)
-			if err != nil {
-				continue
+		}
+	} else {
+		// Legacy path — exact original logic, unchanged.
+		for _, nd := range all {
+			for _, pEnv := range prepareEnvs {
+				if pEnv.SenderID == nd.ID {
+					continue // skip own — already self-counted in Phase 2
+				}
+				cPtr, err := nd.HandlePrepare(pEnv, p.FLocal)
+				if err != nil {
+					continue
+				}
+				if cPtr == nil || commitProduced[nd.ID] {
+					continue // quorum not yet reached for this node, or already committed
+				}
+				// Self-count own Commit immediately (mirrors the Prepare self-count).
+				var selfC messages.Commit
+				if err := messages.DecodeBody(*cPtr, &selfC); err == nil {
+					nd.AddCommit(selfC.SequenceID, nd.ID)
+				}
+				commitEnvs = append(commitEnvs, *cPtr)
+				commitProduced[nd.ID] = true
 			}
-			if cPtr == nil || commitProduced[nd.ID] {
-				continue // quorum not yet reached for this node, or already committed
-			}
-			// Self-count own Commit immediately (mirrors the Prepare self-count).
-			var selfC messages.Commit
-			if err := messages.DecodeBody(*cPtr, &selfC); err == nil {
-				nd.AddCommit(selfC.SequenceID, nd.ID)
-			}
-			commitEnvs = append(commitEnvs, *cPtr)
-			commitProduced[nd.ID] = true
 		}
 	}
 	if len(commitEnvs) == 0 {
@@ -225,22 +284,65 @@ func (p *PBFTInstance) RunPBFT(ctx context.Context, operation, clientID string) 
 	replies := make([]messages.Reply, 0, len(all))
 	replyProduced := make(map[string]bool)
 
-	for _, nd := range all {
-		for _, cEnv := range commitEnvs {
-			if cEnv.SenderID == nd.ID {
-				continue // skip own — self-counted in Phase 3
+	if p.UseReputation {
+		// Reputation path — accumulate commit weight; produce reply once weighted quorum met.
+		for _, nd := range all {
+			for _, cEnv := range commitEnvs {
+				if cEnv.SenderID == nd.ID {
+					continue // skip own — self-counted when commit was produced
+				}
+				var commit messages.Commit
+				messages.DecodeBody(cEnv, &commit)
+				nd.AddCommit(commit.SequenceID, cEnv.SenderID)
+				if replyProduced[nd.ID] {
+					continue
+				}
+				w := nd.GetCommitWeight(commit.SequenceID)
+				if !node.HasReputationQuorum(w, p.TotalClusterReputation) {
+					continue
+				}
+				// Weighted commit quorum met — try standard HandleCommit first.
+				rPtr, rerr := nd.HandleCommit(cEnv, p.FLocal, operation, clientID)
+				if rerr != nil || rPtr == nil {
+					// Build reply directly (HandleCommit gated on count quorum).
+					nd.ApplyOperation(commit.SequenceID, operation)
+					reply := messages.Reply{
+						ViewNumber: commit.ViewNumber,
+						Timestamp:  int64(commit.SequenceID),
+						ClientID:   clientID,
+						NodeID:     nd.ID,
+						Result:     fmt.Sprintf("OK:%s", operation),
+					}
+					replies = append(replies, reply)
+					replyProduced[nd.ID] = true
+					continue
+				}
+				var r messages.Reply
+				if err := messages.DecodeBody(*rPtr, &r); err == nil {
+					replies = append(replies, r)
+					replyProduced[nd.ID] = true
+				}
 			}
-			rPtr, err := nd.HandleCommit(cEnv, p.FLocal, operation, clientID)
-			if err != nil {
-				continue
-			}
-			if rPtr == nil || replyProduced[nd.ID] {
-				continue
-			}
-			var r messages.Reply
-			if err := messages.DecodeBody(*rPtr, &r); err == nil {
-				replies = append(replies, r)
-				replyProduced[nd.ID] = true
+		}
+	} else {
+		// Legacy path — exact original logic, unchanged.
+		for _, nd := range all {
+			for _, cEnv := range commitEnvs {
+				if cEnv.SenderID == nd.ID {
+					continue // skip own — self-counted in Phase 3
+				}
+				rPtr, err := nd.HandleCommit(cEnv, p.FLocal, operation, clientID)
+				if err != nil {
+					continue
+				}
+				if rPtr == nil || replyProduced[nd.ID] {
+					continue
+				}
+				var r messages.Reply
+				if err := messages.DecodeBody(*rPtr, &r); err == nil {
+					replies = append(replies, r)
+					replyProduced[nd.ID] = true
+				}
 			}
 		}
 	}
