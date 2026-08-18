@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"sort"
@@ -44,8 +45,11 @@ var (
 	flagDelay         = flag.Int("delay", 0, "Max simulated V2V phase delay (ms)")
 	flagOut           = flag.String("out", "results.csv", "CSV output path")
 	flagNoPlot        = flag.Bool("no-plot", false, "Skip calling python plot.py after paper-eval")
-	flagReputation    = flag.Bool("reputation", false, "Enable Reputation-Weighted Voting")
+	flagReputation     = flag.Bool("reputation", false, "Enable Reputation-Weighted Voting")
 	flagReputationEval = flag.Bool("reputation-eval", false, "Run the reputation benchmark and save results_reputation_comparison.csv")
+	flagAlpha          = flag.Float64("alpha", 10.0, "Reputation reward numerator (Algorithm 1, α)")
+	flagBeta           = flag.Float64("beta", 1.0, "Reputation reward denominator offset (Algorithm 1, β)")
+	flagGamma          = flag.Float64("gamma", 0.5, "Byzantine penalty multiplier (Algorithm 1, γ)")
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,7 +158,7 @@ func runPaperEvaluation() {
 	fmt.Printf("\n  ✓  Saved → results_static.csv (%d rows)\n", len(staticRows))
 
 	// ── Dynamic testbed (Figure 8) ───────────────────────────────────────────
-	fmt.Println("\n=== DYNAMIC TESTBED (Figure 8) =============================================")
+	fmt.Println("\n=== DYNAMIC TESTBED ")
 	fmt.Println("  (Paper-calibrated: base latency + power-law re-clustering overhead)")
 
 	var dynamicRows []DynamicRow
@@ -520,12 +524,11 @@ func makeGridPoints(p int) []cluster.Point {
 }
 
 func buildClusters(m, n, fLocal, phaseDelayMs int, useReputation bool) []*protocol.PBFTInstance {
-	const rawHigh, rawLow = 100, 10
+	const baseRep = 10.0 // R_init — uniform starting reputation for all nodes
 	instances := make([]*protocol.PBFTInstance, m)
 	for ci := 0; ci < m; ci++ {
 		nodes := make([]*nodemod.Node, n)
 		for j := 0; j < n; j++ {
-			
 			role := nodemod.RoleReplica
 			if j == 0 {
 				role = nodemod.RoleLeader
@@ -551,32 +554,17 @@ func buildClusters(m, n, fLocal, phaseDelayMs int, useReputation bool) []*protoc
 			}
 		}
 
-		var totalRep int
+		var totalRep float64
 		if useReputation {
-			// Compute k = number of high-rep nodes (cluster leaders, ~1/5 of cluster).
-			k := n / 5
-			if n < 5 {
-				k = 1
-			}
-			highRep := rawHigh
-			if k == 1 {
-				// Cap highRep so no single node can satisfy quorum alone.
-				cap := 2*(n-1)*rawLow - 1
-				if highRep > cap {
-					highRep = cap
-				}
-			}
-			clusterReps := make(map[string]int, n)
-			for j, nd := range nodes {
-				rep := rawLow
-				if j < n/5 || (n < 5 && j == 0) {
-					rep = highRep
-				}
-				clusterReps[nd.ID] = rep
-				totalRep += rep
+			// Algorithm 1 — uniform initial reputation for all nodes.
+			// Reputation divergence emerges dynamically through Phase III updates.
+			clusterReps := make(map[string]float64, n)
+			for _, nd := range nodes {
+				clusterReps[nd.ID] = baseRep
+				totalRep += baseRep
 			}
 			for _, nd := range nodes {
-				nd.InitReputation(clusterReps[nd.ID], clusterReps)
+				nd.InitReputation(baseRep, clusterReps)
 			}
 		}
 
@@ -584,6 +572,9 @@ func buildClusters(m, n, fLocal, phaseDelayMs int, useReputation bool) []*protoc
 		inst.PhaseDelayMs = phaseDelayMs
 		inst.UseReputation = useReputation
 		inst.TotalClusterReputation = totalRep
+		inst.Alpha = *flagAlpha
+		inst.Beta = *flagBeta
+		inst.Gamma = *flagGamma
 		instances[ci] = inst
 	}
 	return instances
@@ -595,79 +586,190 @@ func buildClusters(m, n, fLocal, phaseDelayMs int, useReputation bool) []*protoc
 
 // ReputationRow holds one measurement point for the reputation comparison benchmark.
 type ReputationRow struct {
+	Nodes                        int
 	RPS                          int
 	ClassicTP, ClassicLat        float64
 	ClusteredTP, ClusteredLat    float64
 	RepTP, RepLat                float64
 }
 
+// EpochRow captures per-epoch reputation snapshots for the evolution chart.
+type EpochRow struct {
+	Epoch      int
+	NodeID     string
+	NodeType   string  // "honest" or "byzantine"
+	Reputation float64
+}
+
 func runReputationEvaluation() {
-	const totalNodes    = 16
+	nodeCounts := []int{4, 8, 16, 20}
 	const durationSec   = 3
 	const perMsgDelayUs = 100
 
 	loads := []int{100, 200, 300, 400, 500}
-	n, m := computeDims(totalNodes)
-	fLocal  := nodemod.FaultyThresholdLocal(n)
-	fGlobal := nodemod.FaultyThresholdGlobal(totalNodes)
 
-	clusterPhaseDelayMs := (perMsgDelayUs * n) / 1000
-	if clusterPhaseDelayMs < 1 {
-		clusterPhaseDelayMs = 1
-	}
-
-	fmt.Printf("\n═══ REPUTATION EVALUATION (16 nodes) ═════════════════════════════\n")
-	fmt.Printf("  Config: p=%d  n=%d  m=%d  f_local=%d  f_global=%d\n", totalNodes, n, m, fLocal, fGlobal)
-
-	// Classic PBFT reference.
-	classicNodes, err := protocol.BuildClassicPBFTNodes(totalNodes)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  ERROR building classic PBFT nodes: %v\n", err)
-		return
-	}
-	classicPBFT := protocol.NewClassicPBFT(classicNodes, fGlobal, perMsgDelayUs)
-
-	// Clustered baseline (no reputation).
-	instancesBase := buildClusters(m, n, fLocal, clusterPhaseDelayMs, false)
-	coordBase := protocol.NewGlobalCoordinator(instancesBase, fGlobal, nil)
-
-	// Clustered + reputation.
-	instancesRep := buildClusters(m, n, fLocal, clusterPhaseDelayMs, true)
-	coordRep := protocol.NewGlobalCoordinator(instancesRep, fGlobal, nil)
-
-	// Warmup.
-	ctx0 := context.Background()
-	coordBase.RunGlobalTransition(ctx0, 0, "warmup", "client")
-	coordRep.RunGlobalTransition(ctx0, 0, "warmup", "client")
-	classicPBFT.RunConsensus(ctx0, "warmup", "client")
-
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(tw, "  Load(rps)\tClassic TP\tClassic Lat(ms)\tClustered TP\tClustered Lat(ms)\tRep TP\tRep Lat(ms)")
-	fmt.Fprintln(tw, "  --------\t----------\t---------------\t------------\t-----------------\t------\t-----------")
+	fmt.Printf("\n═══ REPUTATION EVALUATION (Algorithm 1: Dynamic Reputation-Driven PBFT) ═══\n")
+	fmt.Printf("  Params: α=%.1f  β=%.1f  γ=%.2f  R_init=10.0\n", *flagAlpha, *flagBeta, *flagGamma)
 
 	var rows []ReputationRow
-	for _, rps := range loads {
-		classicTP, classicLat := measureClassicPBFT(classicPBFT, rps, durationSec)
-		clustTP, clustLat     := measureClustered(coordBase, rps, durationSec)
-		repTP, repLat         := measureClustered(coordRep,  rps, durationSec)
-		rows = append(rows, ReputationRow{
-			RPS: rps,
-			ClassicTP: classicTP, ClassicLat: classicLat,
-			ClusteredTP: clustTP, ClusteredLat: clustLat,
-			RepTP: repTP, RepLat: repLat,
-		})
-		fmt.Fprintf(tw, "  %d\t%.2f\t%.1f\t%.2f\t%.1f\t%.2f\t%.1f\n",
-			rps, classicTP, classicLat, clustTP, clustLat, repTP, repLat)
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(tw, "  Nodes\tLoad(rps)\tClassic TP\tClassic Lat(ms)\tClustered TP\tClustered Lat(ms)\tRep TP\tRep Lat(ms)")
+	fmt.Fprintln(tw, "  -----\t--------\t----------\t---------------\t------------\t-----------------\t------\t-----------")
+
+	for _, totalNodes := range nodeCounts {
+		n, m := computeDims(totalNodes)
+		fLocal  := nodemod.FaultyThresholdLocal(n)
+		fGlobal := nodemod.FaultyThresholdGlobal(totalNodes)
+
+		clusterPhaseDelayMs := (perMsgDelayUs * n) / 1000
+		if clusterPhaseDelayMs < 1 {
+			clusterPhaseDelayMs = 1
+		}
+
+		// Classic PBFT reference.
+		classicNodes, err := protocol.BuildClassicPBFTNodes(totalNodes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  ERROR building classic PBFT nodes: %v\n", err)
+			continue
+		}
+		classicPBFT := protocol.NewClassicPBFT(classicNodes, fGlobal, perMsgDelayUs)
+
+		// Clustered baseline (no reputation).
+		instancesBase := buildClusters(m, n, fLocal, clusterPhaseDelayMs, false)
+		coordBase := protocol.NewGlobalCoordinator(instancesBase, fGlobal, nil)
+
+		// Clustered + dynamic reputation (Algorithm 1).
+		instancesRep := buildClusters(m, n, fLocal, clusterPhaseDelayMs, true)
+		coordRep := protocol.NewGlobalCoordinator(instancesRep, fGlobal, nil)
+
+		// Warmup.
+		ctx0 := context.Background()
+		coordBase.RunGlobalTransition(ctx0, 0, "warmup", "client")
+		coordRep.RunGlobalTransition(ctx0, 0, "warmup", "client")
+		classicPBFT.RunConsensus(ctx0, "warmup", "client")
+
+		for _, rps := range loads {
+			classicTP, classicLat := measureClassicPBFT(classicPBFT, rps, durationSec)
+			clustTP, clustLat     := measureClustered(coordBase, rps, durationSec)
+			repTP, repLat         := measureClustered(coordRep,  rps, durationSec)
+			rows = append(rows, ReputationRow{
+				Nodes: totalNodes,
+				RPS: rps,
+				ClassicTP: classicTP, ClassicLat: classicLat,
+				ClusteredTP: clustTP, ClusteredLat: clustLat,
+				RepTP: repTP, RepLat: repLat,
+			})
+			fmt.Fprintf(tw, "  %d\t%d\t%.2f\t%.1f\t%.2f\t%.1f\t%.2f\t%.1f\n",
+				totalNodes, rps, classicTP, classicLat, clustTP, clustLat, repTP, repLat)
+		}
 	}
 	tw.Flush()
 
 	saveReputationCSV("results_reputation_comparison.csv", rows)
 	fmt.Printf("\n  ✓  Saved → results_reputation_comparison.csv (%d rows)\n", len(rows))
 
+	// Run reputation evolution benchmark (tracks how R_i changes over epochs).
+	runEvolutionBenchmark()
+
 	// Call plotter if available.
 	if !*flagNoPlot {
 		callPlotter()
 	}
+}
+
+// runEvolutionBenchmark simulates 30 consensus epochs on a 16-node cluster,
+// with ~20% of replicas randomly dropping out each round (Byzantine/absent).
+// Records per-epoch reputation snapshots to results_reputation_evolution.csv.
+func runEvolutionBenchmark() {
+	const (
+		totalNodes   = 16
+		numEpochs    = 30
+		perMsgDelay  = 100
+		byzDropRate  = 0.20 // probability a non-leader replica skips a round
+	)
+
+	fmt.Printf("\n  ── Reputation Evolution (%d epochs, %d nodes, %.0f%% drop rate) ──\n",
+		numEpochs, totalNodes, byzDropRate*100)
+
+	n, m := computeDims(totalNodes)
+	fLocal := nodemod.FaultyThresholdLocal(n)
+	clusterPhaseDelayMs := (perMsgDelay * n) / 1000
+	if clusterPhaseDelayMs < 1 {
+		clusterPhaseDelayMs = 1
+	}
+
+	// Build a single cluster for detailed tracking (cluster 0).
+	instances := buildClusters(m, n, fLocal, clusterPhaseDelayMs, true)
+	// Disable auto-update — we drive updates manually to inject Byzantine drops.
+	for _, inst := range instances {
+		inst.DisableAutoReputationUpdate = true
+	}
+
+	rng := rand.New(rand.NewSource(42)) // deterministic for reproducibility
+
+	// Identify which replicas are "byzantine-prone" (randomly skip rounds).
+	// We pick ~20% of non-leader replicas in cluster 0.
+	inst0 := instances[0]
+	allNodes := append([]*nodemod.Node{inst0.Leader}, inst0.Replicas...)
+	byzNodes := make(map[string]bool)
+	for _, nd := range allNodes[1:] { // skip leader
+		if rng.Float64() < byzDropRate*2 { // mark ~40% as byz-prone (they actually drop ~50% of rounds)
+			byzNodes[nd.ID] = true
+		}
+	}
+
+	var epochRows []EpochRow
+
+	// Record initial state (epoch 0).
+	for _, nd := range allNodes {
+		nodeType := "honest"
+		if byzNodes[nd.ID] {
+			nodeType = "byzantine"
+		}
+		epochRows = append(epochRows, EpochRow{
+			Epoch: 0, NodeID: nd.ID, NodeType: nodeType,
+			Reputation: nd.GetReputation(),
+		})
+	}
+
+	ctx := context.Background()
+	for epoch := 1; epoch <= numEpochs; epoch++ {
+		// Run consensus — all nodes participate in PBFT itself.
+		op := fmt.Sprintf("evolution-epoch-%d", epoch)
+		_, err := inst0.RunPBFT(ctx, op, "evo-client")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  epoch %d: RunPBFT error: %v\n", epoch, err)
+			continue
+		}
+
+		// Manually build participant set: honest nodes always participate,
+		// byz-prone nodes randomly drop ~50% of rounds.
+		participants := make(map[string]bool, len(allNodes))
+		for _, nd := range allNodes {
+			if byzNodes[nd.ID] && rng.Float64() < 0.5 {
+				continue // this node is "absent" this round
+			}
+			participants[nd.ID] = true
+		}
+
+		// Phase III + IV: apply reputation update.
+		inst0.ApplyReputationUpdateExternal(participants)
+
+		// Record snapshot.
+		for _, nd := range allNodes {
+			nodeType := "honest"
+			if byzNodes[nd.ID] {
+				nodeType = "byzantine"
+			}
+			epochRows = append(epochRows, EpochRow{
+				Epoch: epoch, NodeID: nd.ID, NodeType: nodeType,
+				Reputation: nd.GetReputation(),
+			})
+		}
+	}
+
+	saveEvolutionCSV("results_reputation_evolution.csv", epochRows)
+	fmt.Printf("  ✓  Saved → results_reputation_evolution.csv (%d snapshots)\n", len(epochRows))
 }
 
 func saveReputationCSV(path string, rows []ReputationRow) {
@@ -679,9 +781,10 @@ func saveReputationCSV(path string, rows []ReputationRow) {
 	defer f.Close()
 	w := csv.NewWriter(f)
 	defer w.Flush()
-	w.Write([]string{"rps", "classic_tp", "classic_lat", "clustered_tp", "clustered_lat", "rep_tp", "rep_lat"})
+	w.Write([]string{"nodes", "rps", "classic_tp", "classic_lat", "clustered_tp", "clustered_lat", "rep_tp", "rep_lat"})
 	for _, r := range rows {
 		w.Write([]string{
+			fmt.Sprintf("%d", r.Nodes),
 			fmt.Sprintf("%d", r.RPS),
 			fmt.Sprintf("%.4f", r.ClassicTP),
 			fmt.Sprintf("%.4f", r.ClassicLat),
@@ -689,6 +792,26 @@ func saveReputationCSV(path string, rows []ReputationRow) {
 			fmt.Sprintf("%.4f", r.ClusteredLat),
 			fmt.Sprintf("%.4f", r.RepTP),
 			fmt.Sprintf("%.4f", r.RepLat),
+		})
+	}
+}
+
+func saveEvolutionCSV(path string, rows []EpochRow) {
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "saveEvolutionCSV: %v\n", err)
+		return
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	defer w.Flush()
+	w.Write([]string{"epoch", "node_id", "node_type", "reputation"})
+	for _, r := range rows {
+		w.Write([]string{
+			fmt.Sprintf("%d", r.Epoch),
+			r.NodeID,
+			r.NodeType,
+			fmt.Sprintf("%.4f", r.Reputation),
 		})
 	}
 }

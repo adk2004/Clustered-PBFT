@@ -14,6 +14,7 @@ package node
 import (
 	"crypto/rsa"
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/adk2004/vehicular-bft/cluster"
@@ -121,13 +122,17 @@ type Node struct {
 	executedSeqs map[int]bool
 	mu           sync.RWMutex
 
-	// ── Reputation-Weighted Voting (RWV extension) ───────────────────────────
-	// Reputation is this node's own trust score (set via InitReputation).
-	Reputation int
+	// ── Dynamic Reputation-Driven PBFT (Algorithm 1) ─────────────────────────
+	// Reputation (R_i) is this node's current dynamic trust score.
+	Reputation float64
 
-	// KnownReputations maps peer node IDs to their reputation scores.
-	// Populated by InitReputation after NewNode; used by GetPrepareWeight / GetCommitWeight.
-	KnownReputations map[string]int
+	// BaseReputation (R_init) is the immutable starting score used in
+	// the logarithmic reward formula: ΔR_inc = α / (ln(1 + R_i - R_init) + β).
+	BaseReputation float64
+
+	// KnownReputations maps peer node IDs to their current reputation scores.
+	// Updated each epoch via SyncReputations (Algorithm 1, Phase IV).
+	KnownReputations map[string]float64
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,68 +402,129 @@ func (n *Node) SetLocation(loc cluster.Point) {
 // Reputation-Weighted Voting (RWV) — additive extension
 // ─────────────────────────────────────────────────────────────────────────────
 
-// InitReputation sets this node's own reputation and its knowledge of peer reputations.
-// Must be called after NewNode, before RunPBFT.
+// InitReputation sets this node's starting reputation (R_init) and its initial
+// knowledge of peer reputations. Must be called after NewNode, before RunPBFT.
 // Thread-safe: holds mu.Lock during write.
-func (n *Node) InitReputation(rep int, clusterReps map[string]int) {
+func (n *Node) InitReputation(rep float64, clusterReps map[string]float64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.Reputation = rep
-	n.KnownReputations = make(map[string]int, len(clusterReps))
+	n.BaseReputation = rep // immutable baseline for the reward formula
+	n.KnownReputations = make(map[string]float64, len(clusterReps))
 	for k, v := range clusterReps {
 		n.KnownReputations[k] = v
 	}
 }
 
 // reputationOf returns the reputation score for a given node ID.
-// Returns 1 (not 0) for unknown nodes to avoid accidental exclusion.
-// Caller must NOT hold mu (calls mu.RLock internally via KnownReputations).
-// NOTE: this is called only from GetPrepareWeight/GetCommitWeight which
-// already hold mu.RLock, so we access KnownReputations directly (no re-lock).
-func (n *Node) reputationOf(id string) int {
+// Returns 1.0 (not 0) for unknown nodes to avoid accidental exclusion.
+// NOTE: called only from GetPrepareWeight/GetCommitWeight which already hold
+// mu.RLock, so KnownReputations is accessed directly without re-locking.
+func (n *Node) reputationOf(id string) float64 {
 	if r, ok := n.KnownReputations[id]; ok {
 		return r
 	}
-	return 1
+	return 1.0
 }
 
-// GetPrepareWeight returns the total reputation weight of all senders
-// that have submitted a Prepare for the given sequence ID.
+// GetPrepareWeight returns the total reputation weight (Ω_prepare) of all
+// senders that submitted a Prepare for seqID. Used in Phase I quorum check.
 // Thread-safe: holds mu.RLock during read.
-func (n *Node) GetPrepareWeight(seqID int) int {
+func (n *Node) GetPrepareWeight(seqID int) float64 {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	senders, ok := n.Prepares[seqID]
 	if !ok {
-		return 0
+		return 0.0
 	}
-	total := 0
+	var total float64
 	for id := range senders {
 		total += n.reputationOf(id)
 	}
 	return total
 }
 
-// GetCommitWeight returns the total reputation weight of all senders
-// that have submitted a Commit for the given sequence ID.
+// GetCommitWeight returns the total reputation weight (Ω_commit) of all
+// senders that submitted a Commit for seqID. Used in Phase I quorum check.
 // Thread-safe: holds mu.RLock during read.
-func (n *Node) GetCommitWeight(seqID int) int {
+func (n *Node) GetCommitWeight(seqID int) float64 {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	senders, ok := n.Commits[seqID]
 	if !ok {
-		return 0
+		return 0.0
 	}
-	total := 0
+	var total float64
 	for id := range senders {
 		total += n.reputationOf(id)
 	}
 	return total
 }
 
-// HasReputationQuorum reports whether accumulatedWeight meets the
-// reputation-weighted quorum threshold for a given totalClusterWeight.
-// The threshold mirrors the classical 2f+1 rule: >= floor(2/3 * total) + 1.
-func HasReputationQuorum(accumulatedWeight, totalClusterWeight int) bool {
-	return accumulatedWeight >= (2*totalClusterWeight/3)+1
+// HasReputationQuorum checks Algorithm 1, Phase I threshold:
+//
+//	τ = ⎪2Ω/3⎪ + 1
+//
+// Returns true when the accumulated vote weight (W_valid) meets or exceeds τ.
+func HasReputationQuorum(accumulatedWeight, totalClusterWeight float64) bool {
+	threshold := math.Floor(2.0*totalClusterWeight/3.0) + 1.0
+	return accumulatedWeight >= threshold
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Algorithm 1 — Phase III & IV: Dynamic update + synchronisation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// UpdateReputation applies Algorithm 1 Phase III to this node's R_i.
+//
+// Honest node (participated in consensus):
+//
+//	ΔR_inc = α / (ln(1 + R_i − R_init) + β)
+//	R_i    ← R_i + ΔR_inc
+//
+// Byzantine/absent node:
+//
+//	R_i ← R_i × γ   (multiplicative decay, 0 < γ < 1)
+//
+// Floor: R_i is clamped to 0 if it drops negative.
+// Thread-safe: holds mu.Lock during write.
+func (n *Node) UpdateReputation(honest bool, alpha, beta, gamma float64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if honest {
+		// Diminishing-returns reward: generous for newcomers, logarithmically
+		// smaller for already-trusted nodes, preventing reputation inflation.
+		excess := math.Max(n.Reputation-n.BaseReputation, 0.0)
+		delta := alpha / (math.Log(1.0+excess) + beta)
+		n.Reputation += delta
+	} else {
+		// Multiplicative penalty: faster decay for severely misbehaving nodes.
+		n.Reputation *= gamma
+	}
+	if n.Reputation < 0 {
+		n.Reputation = 0
+	}
+}
+
+// GetReputation returns this node's current reputation score.
+// Thread-safe: holds mu.RLock during read.
+func (n *Node) GetReputation() float64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.Reputation
+}
+
+// SyncReputations updates this node's KnownReputations map with fresh scores
+// received from peers (Algorithm 1, Phase IV: reputation synchronisation).
+// Does NOT overwrite this node's own Reputation (that is managed locally).
+// Thread-safe: holds mu.Lock during write.
+func (n *Node) SyncReputations(reps map[string]float64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for id, r := range reps {
+		if id == n.ID {
+			continue // own reputation is authoritative — don't overwrite
+		}
+		n.KnownReputations[id] = r
+	}
 }

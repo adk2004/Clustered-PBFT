@@ -364,15 +364,8 @@ def generate_complexity_chart():
 
 def plot_reputation_comparison(csv_path="results_reputation_comparison.csv"):
     """
-    Produce two side-by-side grouped bar charts from the reputation comparison CSV.
-
-    LEFT panel  -- Throughput (req/s) vs RPS
-    RIGHT panel -- Mean Latency (ms) vs RPS
-
-    Each panel has 3 grouped bars per RPS:
-      - Classic PBFT         -> deep blue  #1a4f8a
-      - Clustered PBFT       -> forest green #2d6a4f
-      - Clustered+Reputation -> crimson    #c0392b
+    Produce two side-by-side grouped bar charts from the reputation comparison CSV
+    for each node configuration.
     """
     if not os.path.exists(csv_path):
         print(f"  SKIP  {csv_path} not found -- skipping reputation comparison chart")
@@ -380,90 +373,148 @@ def plot_reputation_comparison(csv_path="results_reputation_comparison.csv"):
         return
 
     df = pd.read_csv(csv_path)
-    required = {"rps", "classic_tp", "classic_lat", "clustered_tp", "clustered_lat", "rep_tp", "rep_lat"}
+    required = {"nodes", "rps", "classic_tp", "classic_lat", "clustered_tp", "clustered_lat", "rep_tp", "rep_lat"}
     if not required.issubset(df.columns):
         print(f"  ERROR: {csv_path} missing columns: {required - set(df.columns)}")
         return
 
-    rps_vals  = df["rps"].values
-    x         = np.arange(len(rps_vals))
-    bar_w     = 0.24
-
     COLOR_CLASSIC   = "#1a4f8a"
     COLOR_CLUSTERED = "#2d6a4f"
     COLOR_REP       = "#c0392b"
+    bar_w     = 0.24
 
-    fig, (ax_tp, ax_lat) = plt.subplots(
-        1, 2, figsize=(13, 5.2),
-        gridspec_kw={"wspace": 0.30},
-        constrained_layout=False,
-    )
-    fig.subplots_adjust(top=0.88, wspace=0.30)
-    fig.suptitle(
-        "Reputation-Weighted Voting: Performance Comparison (16 nodes, 4 clusters)",
-        fontsize=TITLE_SIZE + 1, fontweight="bold"
-    )
+    for node_count in sorted(df['nodes'].unique()):
+        df_nodes = df[df['nodes'] == node_count]
+        rps_vals  = df_nodes["rps"].values
+        x         = np.arange(len(rps_vals))
 
-    for ax in (ax_tp, ax_lat):
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.yaxis.grid(True, linestyle="--", linewidth=0.7, color="#bbbbbb", zorder=0)
-        ax.set_axisbelow(True)
+        fig, (ax_tp, ax_lat) = plt.subplots(
+            1, 2, figsize=(13, 5.2),
+            gridspec_kw={"wspace": 0.30},
+            constrained_layout=False,
+        )
+        fig.subplots_adjust(top=0.88, wspace=0.30)
+        fig.suptitle(
+            f"Reputation-Weighted Voting: Performance Comparison ({node_count} nodes)",
+            fontsize=TITLE_SIZE + 1, fontweight="bold"
+        )
 
-    # ── LEFT: Throughput ─────────────────────────────────────────────────────
-    tp_classic   = df["classic_tp"].values
-    tp_clustered = df["clustered_tp"].values
-    tp_rep       = df["rep_tp"].values
+        for ax in (ax_tp, ax_lat):
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.yaxis.grid(True, linestyle="--", linewidth=0.7, color="#bbbbbb", zorder=0)
+            ax.set_axisbelow(True)
 
-    b1 = ax_tp.bar(x - bar_w,     tp_classic,   bar_w, color=COLOR_CLASSIC,   label="Classic PBFT",          zorder=3, edgecolor="white", linewidth=0.5)
-    b2 = ax_tp.bar(x,             tp_clustered, bar_w, color=COLOR_CLUSTERED, label="Clustered PBFT",         zorder=3, edgecolor="white", linewidth=0.5)
-    b3 = ax_tp.bar(x + bar_w,     tp_rep,       bar_w, color=COLOR_REP,       label="Clustered + Reputation", zorder=3, edgecolor="white", linewidth=0.5)
+        # ── LEFT: Throughput ─────────────────────────────────────────────────────
+        tp_classic   = df_nodes["classic_tp"].values
+        tp_clustered = df_nodes["clustered_tp"].values
+        tp_rep       = df_nodes["rep_tp"].values
 
-    # Bold value labels above each bar.
-    for bars in (b1, b2, b3):
-        for rect in bars:
-            h = rect.get_height()
-            ax_tp.text(
-                rect.get_x() + rect.get_width() / 2, h + 0.5,
-                f"{h:.1f}", ha="center", va="bottom",
-                fontsize=7.5, fontweight="bold", color="#333333"
-            )
+        b1 = ax_tp.bar(x - bar_w,     tp_classic,   bar_w, color=COLOR_CLASSIC,   label="Classic PBFT",          zorder=3, edgecolor="white", linewidth=0.5)
+        b2 = ax_tp.bar(x,             tp_clustered, bar_w, color=COLOR_CLUSTERED, label="Clustered PBFT",         zorder=3, edgecolor="white", linewidth=0.5)
+        b3 = ax_tp.bar(x + bar_w,     tp_rep,       bar_w, color=COLOR_REP,       label="Clustered + Reputation", zorder=3, edgecolor="white", linewidth=0.5)
 
-    ax_tp.set_title("Throughput vs Load", fontsize=TITLE_SIZE)
-    ax_tp.set_xlabel("Requests per Second", fontsize=AXIS_SIZE)
-    ax_tp.set_ylabel("Throughput (req/s)", fontsize=AXIS_SIZE)
-    ax_tp.set_xticks(x)
-    ax_tp.set_xticklabels([str(r) for r in rps_vals], fontsize=TICK_SIZE)
-    ax_tp.set_ylim(0, max(tp_classic.max(), tp_clustered.max(), tp_rep.max()) * 1.35)
-    ax_tp.legend(fontsize=LEGEND_SIZE, framealpha=0.9, edgecolor="#aaaaaa", loc="upper left")
+        for bars in (b1, b2, b3):
+            for rect in bars:
+                h = rect.get_height()
+                ax_tp.text(
+                    rect.get_x() + rect.get_width() / 2, h + 0.5,
+                    f"{h:.1f}", ha="center", va="bottom", rotation=90,
+                    fontsize=7.5, fontweight="bold", color="#333333"
+                )
 
-    # ── RIGHT: Latency ────────────────────────────────────────────────────────
-    lat_classic   = df["classic_lat"].values
-    lat_clustered = df["clustered_lat"].values
-    lat_rep       = df["rep_lat"].values
+        ax_tp.set_title("Throughput vs Load", fontsize=TITLE_SIZE)
+        ax_tp.set_xlabel("Requests per Second", fontsize=AXIS_SIZE)
+        ax_tp.set_ylabel("Throughput (req/s)", fontsize=AXIS_SIZE)
+        ax_tp.set_xticks(x)
+        ax_tp.set_xticklabels([str(r) for r in rps_vals], fontsize=TICK_SIZE)
+        ax_tp.set_ylim(0, max(tp_classic.max(), tp_clustered.max(), tp_rep.max()) * 1.35)
+        ax_tp.legend(fontsize=LEGEND_SIZE, framealpha=0.9, edgecolor="#aaaaaa", loc="upper left")
 
-    b4 = ax_lat.bar(x - bar_w,   lat_classic,   bar_w, color=COLOR_CLASSIC,   label="Classic PBFT",          zorder=3, edgecolor="white", linewidth=0.5)
-    b5 = ax_lat.bar(x,           lat_clustered, bar_w, color=COLOR_CLUSTERED, label="Clustered PBFT",         zorder=3, edgecolor="white", linewidth=0.5)
-    b6 = ax_lat.bar(x + bar_w,   lat_rep,       bar_w, color=COLOR_REP,       label="Clustered + Reputation", zorder=3, edgecolor="white", linewidth=0.5)
+        # ── RIGHT: Latency ────────────────────────────────────────────────────────
+        lat_classic   = df_nodes["classic_lat"].values
+        lat_clustered = df_nodes["clustered_lat"].values
+        lat_rep       = df_nodes["rep_lat"].values
 
-    for bars in (b4, b5, b6):
-        for rect in bars:
-            h = rect.get_height()
-            ax_lat.text(
-                rect.get_x() + rect.get_width() / 2, h + 0.5,
-                f"{h:.1f}", ha="center", va="bottom",
-                fontsize=7.5, fontweight="bold", color="#333333"
-            )
+        b4 = ax_lat.bar(x - bar_w,   lat_classic,   bar_w, color=COLOR_CLASSIC,   label="Classic PBFT",          zorder=3, edgecolor="white", linewidth=0.5)
+        b5 = ax_lat.bar(x,           lat_clustered, bar_w, color=COLOR_CLUSTERED, label="Clustered PBFT",         zorder=3, edgecolor="white", linewidth=0.5)
+        b6 = ax_lat.bar(x + bar_w,   lat_rep,       bar_w, color=COLOR_REP,       label="Clustered + Reputation", zorder=3, edgecolor="white", linewidth=0.5)
 
-    ax_lat.set_title("Mean Latency vs Load", fontsize=TITLE_SIZE)
-    ax_lat.set_xlabel("Requests per Second", fontsize=AXIS_SIZE)
-    ax_lat.set_ylabel("Mean Latency (ms)", fontsize=AXIS_SIZE)
-    ax_lat.set_xticks(x)
-    ax_lat.set_xticklabels([str(r) for r in rps_vals], fontsize=TICK_SIZE)
-    ax_lat.set_ylim(0, max(lat_classic.max(), lat_clustered.max(), lat_rep.max()) * 1.35)
-    ax_lat.legend(fontsize=LEGEND_SIZE, framealpha=0.9, edgecolor="#aaaaaa", loc="upper left")
+        for bars in (b4, b5, b6):
+            for rect in bars:
+                h = rect.get_height()
+                ax_lat.text(
+                    rect.get_x() + rect.get_width() / 2, h + 0.5,
+                    f"{h:.1f}", ha="center", va="bottom", rotation=90,
+                    fontsize=7.5, fontweight="bold", color="#333333"
+                )
 
-    out_path = "reputation_performance.png"
+        ax_lat.set_title("Mean Latency vs Load", fontsize=TITLE_SIZE)
+        ax_lat.set_xlabel("Requests per Second", fontsize=AXIS_SIZE)
+        ax_lat.set_ylabel("Mean Latency (ms)", fontsize=AXIS_SIZE)
+        ax_lat.set_xticks(x)
+        ax_lat.set_xticklabels([str(r) for r in rps_vals], fontsize=TICK_SIZE)
+        ax_lat.set_ylim(0, max(lat_classic.max(), lat_clustered.max(), lat_rep.max()) * 1.35)
+        ax_lat.legend(fontsize=LEGEND_SIZE, framealpha=0.9, edgecolor="#aaaaaa", loc="upper left")
+
+        out_path = f"reputation_performance_{node_count}nodes.png"
+        fig.savefig(out_path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  OK  Saved {out_path}")
+
+
+# ---------------------------------------------------------------------------------
+# Reputation Evolution chart
+# ---------------------------------------------------------------------------------
+
+def plot_reputation_evolution(csv_path="results_reputation_evolution.csv"):
+    """
+    Produce a line chart showing how reputation evolves over epochs for honest vs
+    Byzantine (absent) nodes, demonstrating Algorithm 1's Phase III (Dynamic Update).
+    """
+    if not os.path.exists(csv_path):
+        print(f"  SKIP  {csv_path} not found -- skipping reputation evolution chart")
+        return
+
+    df = pd.read_csv(csv_path)
+    required = {"epoch", "node_id", "node_type", "reputation"}
+    if not required.issubset(df.columns):
+        print(f"  ERROR: {csv_path} missing columns: {required - set(df.columns)}")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.grid(True, linestyle="--", linewidth=0.7, color="#bbbbbb", zorder=0)
+    ax.set_axisbelow(True)
+
+    COLOR_HONEST    = "#2d6a4f" # forest green
+    COLOR_BYZANTINE = "#c0392b" # crimson
+
+    # Group by epoch and node_type to get mean reputation
+    grouped = df.groupby(["epoch", "node_type"])["reputation"].mean().unstack()
+
+    if "honest" in grouped.columns:
+        ax.plot(grouped.index, grouped["honest"], marker='o', markersize=6, 
+                color=COLOR_HONEST, linewidth=2, label="Honest Replicas (Mean)")
+    if "byzantine" in grouped.columns:
+        ax.plot(grouped.index, grouped["byzantine"], marker='x', markersize=6, 
+                color=COLOR_BYZANTINE, linewidth=2, linestyle="--", label="Byzantine-prone Replicas (Mean)")
+
+    ax.set_title("Algorithm 1: Dynamic Reputation Evolution", fontsize=TITLE_SIZE)
+    ax.set_xlabel("Consensus Epochs", fontsize=AXIS_SIZE)
+    ax.set_ylabel("Reputation Score ($R_i$)", fontsize=AXIS_SIZE)
+    
+    # Set y-axis starting from 0
+    y_max = grouped.max().max() if not grouped.empty else 10.0
+    ax.set_ylim(0, max(y_max * 1.1, 15.0))
+    
+    # Highlight the starting Base Reputation
+    ax.axhline(y=10.0, color='gray', linestyle=':', label='Base Reputation ($R_{init}$)')
+
+    ax.legend(fontsize=LEGEND_SIZE, framealpha=0.9, edgecolor="#aaaaaa", loc="upper left")
+
+    out_path = "reputation_evolution.png"
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"  OK  Saved {out_path}")
@@ -523,11 +574,15 @@ def main():
 
     # -- Reputation comparison (graceful skip if CSV not present) ---------------
     plot_reputation_comparison()
+    plot_reputation_evolution()
 
     print("\n=== Summary of generated files =====================================")
     expected = ["fig4_8nodes.png","fig5_12nodes.png","fig6_16nodes.png",
                 "fig7_20nodes.png","fig8_dynamic.png","fig_complexity.png",
-                "all_figures.png", "reputation_performance.png"]
+                "all_figures.png", 
+                "reputation_performance_4nodes.png", "reputation_performance_8nodes.png",
+                "reputation_performance_16nodes.png", "reputation_performance_20nodes.png",
+                "reputation_evolution.png"]
     for f in expected:
         status = "OK" if os.path.exists(f) else "MISSING"
         print(f"  {status}  {f}")

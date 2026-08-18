@@ -75,14 +75,32 @@ type PBFTInstance struct {
 	opLog map[int]string
 	mu    sync.Mutex
 
-	// ── Reputation-Weighted Voting (RWV) extension ───────────────────────────
+	// ── Dynamic Reputation-Driven PBFT (Algorithm 1) ─────────────────────────
 	// UseReputation activates reputation-weighted quorum when true.
 	// When false the exact legacy path is used (zero-breakage guarantee).
 	UseReputation bool
 
-	// TotalClusterReputation is the sum of all node reputation scores in this cluster.
-	// Required for HasReputationQuorum threshold computation.
-	TotalClusterReputation int
+	// TotalClusterReputation (Ω) is the sum of all node reputation scores.
+	// Used as the quorum denominator; recomputed after every epoch update.
+	TotalClusterReputation float64
+
+	// Alpha (α) is the numerator of the logarithmic reward formula.
+	Alpha float64
+
+	// Beta (β) shifts the ln denominator, preventing division by zero and
+	// controlling the rate of diminishing returns.
+	Beta float64
+
+	// Gamma (γ) is the Byzantine penalty multiplier (0 < γ < 1).
+	Gamma float64
+
+	// Epoch counts how many consensus rounds have completed with reputation updates.
+	Epoch int
+
+	// DisableAutoReputationUpdate prevents RunPBFT from automatically calling
+	// applyReputationUpdate at the end of each round. Set to true when the caller
+	// manages reputation updates externally (e.g., evolution benchmark).
+	DisableAutoReputationUpdate bool
 }
 
 // NewPBFTInstance creates a PBFTInstance.
@@ -351,6 +369,15 @@ func (p *PBFTInstance) RunPBFT(ctx context.Context, operation, clientID string) 
 			len(commitEnvs), 2*p.FLocal+1)
 	}
 
+	// ── Phase III & IV: Dynamic Reputation Update + Synchronisation ───────────
+	if p.UseReputation && p.Alpha > 0 && !p.DisableAutoReputationUpdate {
+		participantIDs := make(map[string]bool, len(prepareEnvs))
+		for _, env := range prepareEnvs {
+			participantIDs[env.SenderID] = true
+		}
+		p.applyReputationUpdate(participantIDs)
+	}
+
 	return replies, nil
 }
 
@@ -427,6 +454,53 @@ func (p *PBFTInstance) ReceiveCommit(receiverID string, env messages.Envelope, c
 		return nil, fmt.Errorf("ReceiveCommit: decode reply: %w", err)
 	}
 	return &r, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Algorithm 1 — Phase III + IV: Dynamic Reputation Update
+// ─────────────────────────────────────────────────────────────────────────────
+
+// applyReputationUpdate runs after every successful RunPBFT round.
+//
+// Phase III — for each node in the cluster:
+//   - Honest (sent a Prepare): logarithmic reward  ΔR = α / (ln(1+R−R_init) + β)
+//   - Absent/Byzantine:        multiplicative decay R_i *= γ
+//
+// Phase IV — collect the updated reputation vector R and broadcast it to
+// all nodes so every peer's KnownReputations map is consistent.
+// Finally recompute TotalClusterReputation (Ω) for the next round's quorum.
+func (p *PBFTInstance) applyReputationUpdate(participantIDs map[string]bool) {
+	all := p.allNodes()
+
+	// Phase III: update each node's own reputation.
+	for _, nd := range all {
+		honest := participantIDs[nd.ID]
+		nd.UpdateReputation(honest, p.Alpha, p.Beta, p.Gamma)
+	}
+
+	// Phase IV: collect updated vector R and broadcast.
+	updatedReps := make(map[string]float64, len(all))
+	var totalRep float64
+	for _, nd := range all {
+		r := nd.GetReputation()
+		updatedReps[nd.ID] = r
+		totalRep += r
+	}
+	for _, nd := range all {
+		nd.SyncReputations(updatedReps)
+	}
+
+	// Update the instance's Ω so the next round's quorum threshold reflects
+	// the new reputation distribution.
+	p.TotalClusterReputation = totalRep
+	p.Epoch++
+}
+
+// ApplyReputationUpdateExternal is the public version of applyReputationUpdate,
+// used by external callers (e.g., the reputation evolution benchmark) that set
+// DisableAutoReputationUpdate = true and drive updates manually.
+func (p *PBFTInstance) ApplyReputationUpdateExternal(participantIDs map[string]bool) {
+	p.applyReputationUpdate(participantIDs)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

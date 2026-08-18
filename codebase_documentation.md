@@ -24,10 +24,6 @@
 13. [main.go — Simulation Runner](#13-maingo--simulation-runner)
 14. [plot.py — Graph Generation](#14-plotpy--graph-generation)
 15. [How to Run Everything](#15-how-to-run-everything)
-16. [Presentation Guide](#16-presentation-guide)
-17. [Limitations and Honest Assessment](#17-limitations-and-honest-assessment)
-18. [Expected Professor Questions](#18-expected-professor-questions)
-
 ---
 
 ## 1. What This Project Is
